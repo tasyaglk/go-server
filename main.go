@@ -1,11 +1,3 @@
-// package main
-
-// import "fmt"
-
-// func main() {
-// 	fmt.Println("Hello, World!")
-// }
-
 package main
 
 import (
@@ -28,7 +20,6 @@ type User struct {
 	PasswordHash string `json:"-"`
 }
 
-// Подключение к PostgreSQL
 func connectDB() *sql.DB {
 	connStr := "user=postgres dbname=postgres password=mypassword host=localhost sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
@@ -38,7 +29,6 @@ func connectDB() *sql.DB {
 	return db
 }
 
-// GET /users - получить всех пользователей
 func getUsersHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -67,7 +57,6 @@ func getUsersHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-// POST /users - создать пользователя
 func createUserHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -101,7 +90,6 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(newUser)
 }
 
-// POST /users - создать пользователя
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -119,7 +107,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Хэшируем пароль
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.Password), bcrypt.DefaultCost)
 	if err != nil {
 		http.Error(w, "Server error", http.StatusInternalServerError)
@@ -170,14 +157,12 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Сравниваем хэши
 	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(credentials.Password))
 	if err != nil {
 		http.Error(w, "Invalid password", http.StatusUnauthorized)
 		return
 	}
 
-	// Возвращаем данные пользователя (без пароля)
 	json.NewEncoder(w).Encode(user)
 }
 
@@ -200,7 +185,6 @@ func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
 	db := connectDB()
 	defer db.Close()
 
-	// Получаем хэш старого пароля из базы данных
 	var passwordHash string
 	err = db.QueryRow("SELECT password_hash FROM users WHERE email = $1", request.Email).Scan(&passwordHash)
 	if err != nil {
@@ -212,21 +196,18 @@ func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Проверяем, совпадает ли старый пароль
 	err = bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(request.OldPassword))
 	if err != nil {
 		http.Error(w, "Invalid old password", http.StatusUnauthorized)
 		return
 	}
 
-	// Хэшируем новый пароль
 	newHashedPassword, err := bcrypt.GenerateFromPassword([]byte(request.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Обновляем пароль в базе данных
 	_, err = db.Exec("UPDATE users SET password_hash = $1 WHERE email = $2", newHashedPassword, request.Email)
 	if err != nil {
 		http.Error(w, "Server error", http.StatusInternalServerError)
