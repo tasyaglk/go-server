@@ -9,6 +9,9 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"time"
+
+	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
 
@@ -18,6 +21,136 @@ type User struct {
 	Surname      string `json:"surname"`
 	Email        string `json:"email"`
 	PasswordHash string `json:"-"`
+}
+
+// Goal structure
+type Goal struct {
+	ID          uuid.UUID `json:"id"`
+	UserID      int       `json:"user_id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	StartTime   time.Time `json:"start_time"`
+	Duration    string    `json:"duration"`
+	Color       string    `json:"color"`
+	IsPinned    bool      `json:"is_pinned"`
+	IsCompleted bool      `json:"is_completed"`
+}
+
+// Create goal handler
+func createGoalHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var goal Goal
+	err := json.NewDecoder(r.Body).Decode(&goal)
+	if err != nil {
+		http.Error(w, "Invalid data", http.StatusBadRequest)
+		return
+	}
+
+	goal.ID = uuid.New()
+
+	db := connectDB()
+	defer db.Close()
+
+	_, err = db.Exec(`
+    INSERT INTO goals (id, user_id, title, description, start_time, duration, color, is_pinned, is_completed)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		goal.ID, goal.UserID, goal.Title, goal.Description, goal.StartTime, goal.Duration, goal.Color, goal.IsPinned, goal.IsCompleted)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(goal)
+}
+
+// Get goals handler
+func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	db := connectDB()
+	defer db.Close()
+
+	rows, err := db.Query("SELECT * FROM goals WHERE user_id = $1", userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var g Goal
+		err := rows.Scan(&g.ID, &g.UserID, &g.Title, &g.Description, &g.StartTime, &g.Duration, &g.Color, &g.IsPinned, &g.IsCompleted)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		goals = append(goals, g)
+	}
+
+	json.NewEncoder(w).Encode(goals)
+}
+
+// Update goal handler
+func updateGoalHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var goal Goal
+	if err := json.NewDecoder(r.Body).Decode(&goal); err != nil {
+		http.Error(w, "Invalid data", http.StatusBadRequest)
+		return
+	}
+
+	db := connectDB()
+	defer db.Close()
+
+	_, err := db.Exec(`
+    UPDATE goals 
+    SET title = $1, description = $2, start_time = $3, duration = $4, color = $5, is_pinned = $6, is_completed = $7
+    WHERE id = $8 AND user_id = $9`,
+		goal.Title, goal.Description, goal.StartTime, goal.Duration, goal.Color, goal.IsPinned, goal.IsCompleted, goal.ID, goal.UserID)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(goal)
+}
+
+// Delete goal handler
+func deleteGoalHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	id := r.URL.Query().Get("id")
+	userID := r.URL.Query().Get("user_id")
+	if id == "" || userID == "" {
+		http.Error(w, "Missing parameters", http.StatusBadRequest)
+		return
+	}
+
+	db := connectDB()
+	defer db.Close()
+
+	_, err := db.Exec("DELETE FROM goals WHERE id = $1 AND user_id = $2", uuid.MustParse(id), userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"message": "Goal deleted successfully"})
 }
 
 func connectDB() *sql.DB {
@@ -224,6 +357,21 @@ func main() {
 			getUsersHandler(w, r)
 		case "POST":
 			createUserHandler(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/goals", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			getGoalsHandler(w, r)
+		case "POST":
+			createGoalHandler(w, r)
+		case "PUT":
+			updateGoalHandler(w, r)
+		case "DELETE":
+			deleteGoalHandler(w, r)
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
