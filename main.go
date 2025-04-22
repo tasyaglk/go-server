@@ -17,12 +17,13 @@ import (
 )
 
 type Subtask struct {
-	ID          uuid.UUID `json:"id"`
-	Title       string    `json:"title"`
-	Deadline    time.Time `json:"deadline"`
-	IsCompleted bool      `json:"is_completed"`
-	Color       string    `json:"color"`
-	GoalName    string    `json:"goal_name"`
+	ID              uuid.UUID `json:"id"`
+	Title           string    `json:"title"`
+	Deadline        time.Time `json:"deadline"`
+	IsCompleted     bool      `json:"is_completed"`
+	Color           string    `json:"color"`
+	GoalName        string    `json:"goal_name"`
+	CalendarEventID *string   `json:"calendar_event_id"`
 }
 
 type Goal struct {
@@ -123,9 +124,10 @@ func createGoalHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_, err = tx.Exec(`
-			INSERT INTO subtasks (id, goal_id, title, deadline, is_completed, color, goal_name)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			subtask.ID, goal.ID, subtask.Title, subtask.Deadline, subtask.IsCompleted, subtask.Color, subtask.GoalName)
+			INSERT INTO subtasks (id, goal_id, title, deadline, is_completed, color, goal_name, calendar_event_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			subtask.ID, goal.ID, subtask.Title, subtask.Deadline, subtask.IsCompleted,
+			subtask.Color, subtask.GoalName, subtask.CalendarEventID)
 
 		if err != nil {
 			tx.Rollback()
@@ -181,8 +183,8 @@ func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Получение подзадач
 		subtaskRows, err := db.Query(`
-			SELECT id, title, deadline, is_completed, color, goal_name
-			FROM subtasks 
+			SELECT id, title, deadline, is_completed, color, goal_name, calendar_event_id
+			FROM subtasks
 			WHERE goal_id = $1`, g.ID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -193,7 +195,8 @@ func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
 		completedCount := 0
 		for subtaskRows.Next() {
 			var s Subtask
-			err := subtaskRows.Scan(&s.ID, &s.Title, &s.Deadline, &s.IsCompleted, &s.Color, &s.GoalName)
+			err := subtaskRows.Scan(&s.ID, &s.Title, &s.Deadline, &s.IsCompleted, &s.Color, &s.GoalName, &s.CalendarEventID)
+
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -211,6 +214,10 @@ func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
 
 	}
 
+	if len(goals) == 0 {
+		w.Write([]byte("[]"))
+		return
+	}
 	json.NewEncoder(w).Encode(goals)
 }
 
@@ -268,9 +275,10 @@ func updateGoalHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_, err = tx.Exec(`
-			INSERT INTO subtasks (id, goal_id, title, deadline, is_completed, color, goal_name)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			subtask.ID, goal.ID, subtask.Title, subtask.Deadline, subtask.IsCompleted, subtask.Color, subtask.GoalName)
+			INSERT INTO subtasks (id, goal_id, title, deadline, is_completed, color, goal_name, calendar_event_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			subtask.ID, goal.ID, subtask.Title, subtask.Deadline, subtask.IsCompleted,
+			subtask.Color, subtask.GoalName, subtask.CalendarEventID)
 
 		if err != nil {
 			tx.Rollback()
@@ -325,12 +333,23 @@ func getAllSubtasksHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
+	userIDStr := r.URL.Query().Get("userId")
+	if userIDStr == "" {
+		http.Error(w, "Missing userId parameter", http.StatusBadRequest)
+		return
+	}
+
 	db := connectDB()
 	defer db.Close()
 
 	rows, err := db.Query(`
-		SELECT id, title, deadline, is_completed, color, goal_name
-		FROM subtasks`)
+		SELECT s.id, s.title, s.deadline, s.is_completed, s.color, g.title, s.calendar_event_id
+		AS goal_name
+		FROM subtasks s
+		INNER JOIN goals g ON s.goal_id = g.id
+		WHERE g.user_id = $1
+	`, userIDStr)
+
 	if err != nil {
 		http.Error(w, "Failed to fetch subtasks", http.StatusInternalServerError)
 		return
@@ -340,14 +359,17 @@ func getAllSubtasksHandler(w http.ResponseWriter, r *http.Request) {
 	var subtasks []Subtask
 	for rows.Next() {
 		var s Subtask
-		// var goalID uuid.UUID // если вдруг нужно будет вернуть goal_id тоже
+		err := rows.Scan(&s.ID, &s.Title, &s.Deadline, &s.IsCompleted, &s.Color, &s.GoalName, &s.CalendarEventID)
 
-		err := rows.Scan(&s.ID, &s.Title, &s.Deadline, &s.IsCompleted, &s.Color, &s.GoalName)
 		if err != nil {
 			http.Error(w, "Error scanning subtask", http.StatusInternalServerError)
 			return
 		}
 		subtasks = append(subtasks, s)
+	}
+
+	if subtasks == nil {
+		subtasks = []Subtask{}
 	}
 
 	json.NewEncoder(w).Encode(subtasks)
@@ -385,6 +407,50 @@ func toggleSubtaskCompletionHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "Subtask updated successfully"})
+}
+
+func getSubtasksByGoalHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	vars := mux.Vars(r)
+	goalIDStr := vars["goal_id"]
+	goalID, err := uuid.Parse(goalIDStr)
+	if err != nil {
+		http.Error(w, "Invalid goal ID", http.StatusBadRequest)
+		return
+	}
+
+	db := connectDB()
+	defer db.Close()
+
+	rows, err := db.Query(`
+		SELECT id, title, deadline, is_completed, color, goal_name, calendar_event_id
+		FROM subtasks
+		WHERE goal_id = $1`, goalID)
+	if err != nil {
+		http.Error(w, "Failed to fetch subtasks", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var subtasks []Subtask
+	for rows.Next() {
+		var s Subtask
+		err := rows.Scan(&s.ID, &s.Title, &s.Deadline, &s.IsCompleted, &s.Color, &s.GoalName, &s.CalendarEventID)
+
+		if err != nil {
+			http.Error(w, "Error scanning subtask", http.StatusInternalServerError)
+			return
+		}
+		subtasks = append(subtasks, s)
+	}
+
+	if subtasks == nil {
+		subtasks = []Subtask{}
+	}
+
+	json.NewEncoder(w).Encode(subtasks)
 }
 
 func getUsersHandler(w http.ResponseWriter, r *http.Request) {
@@ -601,6 +667,7 @@ func main() {
 	router.HandleFunc("/goals/{id}", deleteGoalHandler).Methods("DELETE")
 	router.HandleFunc("/subtasks", getAllSubtasksHandler).Methods("GET")
 	router.HandleFunc("/subtasks/{id}/complete", toggleSubtaskCompletionHandler).Methods("PUT")
+	router.HandleFunc("/goals/{goal_id}/subtasks", getSubtasksByGoalHandler).Methods("GET")
 
 	// Обработчики пользователей
 	router.HandleFunc("/users", getUsersHandler).Methods("GET")
