@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-
-	"golang.org/x/crypto/bcrypt"
-
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Subtask struct {
@@ -55,6 +53,14 @@ func connectDB() *sql.DB {
 
 	// Создаём таблицы при подключении
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL,
+			surname TEXT NOT NULL,
+			email TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL
+		);
+
 		CREATE TABLE IF NOT EXISTS goals (
 			id UUID PRIMARY KEY,
 			user_id INTEGER NOT NULL,
@@ -70,7 +76,10 @@ func connectDB() *sql.DB {
 			goal_id UUID REFERENCES goals(id) ON DELETE CASCADE,
 			title TEXT NOT NULL,
 			deadline TIMESTAMP WITH TIME ZONE NOT NULL,
-			is_completed BOOLEAN NOT NULL DEFAULT false
+			is_completed BOOLEAN NOT NULL DEFAULT false,
+			color TEXT,
+			goal_name TEXT,
+			calendar_event_id TEXT
 		);
 	`)
 	if err != nil {
@@ -80,7 +89,103 @@ func connectDB() *sql.DB {
 	return db
 }
 
-// Обработчики для целей с поддержкой подзадач
+// Обработчик удаления пользователя
+func deleteUserHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Получаем user_id из URL
+	vars := mux.Vars(r)
+	userIDStr := vars["id"]
+	if userIDStr == "" {
+		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, что user_id — число
+	var userID int
+	_, err := fmt.Sscanf(userIDStr, "%d", &userID)
+	if err != nil {
+		http.Error(w, "Invalid user_id format", http.StatusBadRequest)
+		return
+	}
+
+	db := connectDB()
+	defer db.Close()
+
+	// Начинаем транзакцию
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Failed to start transaction: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Удаляем подзадачи
+	result, err := tx.Exec(`
+		DELETE FROM subtasks 
+		WHERE goal_id IN (SELECT id FROM goals WHERE user_id = $1)`, userID)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete subtasks for user %d: %v", userID, err)
+		http.Error(w, "Failed to delete subtasks", http.StatusInternalServerError)
+		return
+	}
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("Deleted %d subtasks for user %d", rowsAffected, userID)
+
+	// Удаляем цели пользователя
+	result, err = tx.Exec("DELETE FROM goals WHERE user_id = $1", userID)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete goals for user %d: %v", userID, err)
+		http.Error(w, "Failed to delete goals", http.StatusInternalServerError)
+		return
+	}
+	rowsAffected, _ = result.RowsAffected()
+	log.Printf("Deleted %d goals for user %d", rowsAffected, userID)
+
+	// Удаляем пользователя
+	result, err = tx.Exec("DELETE FROM users WHERE id = $1", userID)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete user %d: %v", userID, err)
+		http.Error(w, "Failed to delete user", http.StatusInternalServerError)
+		return
+	}
+
+	// Проверяем, был ли удалён пользователь
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Error checking user deletion for user %d: %v", userID, err)
+		http.Error(w, "Error checking deletion", http.StatusInternalServerError)
+		return
+	}
+	if rowsAffected == 0 {
+		tx.Rollback()
+		log.Printf("User %d not found", userID)
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	// Подтверждаем транзакцию
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("Failed to commit transaction for user %d: %v", userID, err)
+		http.Error(w, "Failed to commit transaction", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successfully deleted user %d", userID)
+	// Возвращаем ответ
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "User and associated data deleted successfully",
+	})
+}
+
+// Остальные обработчики (без изменений)
 func createGoalHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -211,7 +316,6 @@ func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
 		g.Subtasks = subtasks
 		g.CompletedSubtaskCount = completedCount
 		goals = append(goals, g)
-
 	}
 
 	if len(goals) == 0 {
@@ -221,7 +325,6 @@ func getGoalsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(goals)
 }
 
-// Обновлённый обработчик для целей
 func updateGoalHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -290,12 +393,10 @@ func updateGoalHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(goal)
 }
 
-// Delete goal handler (обновлённая версия)
 func deleteGoalHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Получаем параметры из URL
 	vars := mux.Vars(r)
 	goalID, err := uuid.Parse(vars["id"])
 	if err != nil {
@@ -312,7 +413,6 @@ func deleteGoalHandler(w http.ResponseWriter, r *http.Request) {
 	db := connectDB()
 	defer db.Close()
 
-	// Удаление цели (подзадачи удалятся каскадно благодаря FOREIGN KEY)
 	_, err = db.Exec(`
         DELETE FROM goals 
         WHERE id = $1 AND user_id = $2`,
@@ -344,7 +444,6 @@ func getAllSubtasksHandler(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(`
 		SELECT s.id, s.title, s.deadline, s.is_completed, s.color, g.title, s.calendar_event_id
-		AS goal_name
 		FROM subtasks s
 		INNER JOIN goals g ON s.goal_id = g.id
 		WHERE g.user_id = $1
@@ -641,8 +740,176 @@ func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "Password updated successfully"})
 }
 
+// reformulateGoalHandler handles goal reformulation
+func reformulateGoalHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Goal string `json:"goal"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		result, err := deepSeek.ReformulateGoal(request.Goal)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]string{"result": result})
+	}
+}
+
+// validateGoalHandler validates a goal's moral and social acceptability
+func validateGoalHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Goal string `json:"goal"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		result, err := deepSeek.ValidateGoal(request.Goal)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]bool{"is_valid": result})
+	}
+}
+
+// validatePlanFeedbackHandler checks if feedback relates to the goal's plan
+func validatePlanFeedbackHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Feedback string `json:"feedback"`
+			Goal     string `json:"goal"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		result, err := deepSeek.ValidatePlanFeedback(request.Feedback, request.Goal)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]bool{"is_valid": result})
+	}
+}
+
+// validateScheduleFeedbackHandler checks if feedback relates to scheduling
+func validateScheduleFeedbackHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Feedback string `json:"feedback"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		result, err := deepSeek.ValidateScheduleFeedback(request.Feedback)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]bool{"is_valid": result})
+	}
+}
+
+// generateStepsHandler generates steps to achieve a goal
+func generateStepsHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Goal      string `json:"goal"`
+			Knowledge string `json:"knowledge"`
+			Feedback  string `json:"feedback"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		result, err := deepSeek.GenerateSteps(request.Goal, request.Knowledge, request.Feedback)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string][]string{"steps": result})
+	}
+}
+
+// generateScheduleHandler creates a schedule for given steps
+func generateScheduleHandler(deepSeek *DeepSeekManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var request struct {
+			Steps        []string    `json:"steps"`
+			Availability string      `json:"availability"`
+			Frequency    string      `json:"frequency"`
+			Feedback     string      `json:"feedback"`
+			BusySlots    [][2]string `json:"busy_slots"` // Expecting [start, end] in RFC3339
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid data", http.StatusBadRequest)
+			return
+		}
+
+		// Parse busy slots
+		var busySlots [][2]time.Time
+		for _, slot := range request.BusySlots {
+			start, err := time.Parse(time.RFC3339, slot[0])
+			if err != nil {
+				http.Error(w, "Invalid start time format", http.StatusBadRequest)
+				return
+			}
+			end, err := time.Parse(time.RFC3339, slot[1])
+			if err != nil {
+				http.Error(w, "Invalid end time format", http.StatusBadRequest)
+				return
+			}
+			busySlots = append(busySlots, [2]time.Time{start, end})
+		}
+
+		result, err := deepSeek.GenerateSchedule(request.Steps, request.Availability, request.Frequency, request.Feedback, busySlots)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]string{"schedule": result})
+	}
+}
+
 func main() {
 	router := mux.NewRouter()
+	deepSeekManager := NewDeepSeekManager()
 
 	// CORS middleware
 	router.Use(func(next http.Handler) http.Handler {
@@ -669,12 +936,20 @@ func main() {
 	router.HandleFunc("/subtasks/{id}/complete", toggleSubtaskCompletionHandler).Methods("PUT")
 	router.HandleFunc("/goals/{goal_id}/subtasks", getSubtasksByGoalHandler).Methods("GET")
 
-	// Обработчики пользователей
+	// Пользователи
 	router.HandleFunc("/users", getUsersHandler).Methods("GET")
 	router.HandleFunc("/users", createUserHandler).Methods("POST")
+	router.HandleFunc("/users/{id}", deleteUserHandler).Methods("DELETE")
 	router.HandleFunc("/register", registerHandler).Methods("POST")
 	router.HandleFunc("/login", loginHandler).Methods("POST")
 	router.HandleFunc("/change-password", changePasswordHandler).Methods("POST")
+
+	router.HandleFunc("/deepseek/reformulate-goal", reformulateGoalHandler(deepSeekManager)).Methods("POST")
+	router.HandleFunc("/deepseek/validate-goal", validateGoalHandler(deepSeekManager)).Methods("POST")
+	router.HandleFunc("/deepseek/validate-plan-feedback", validatePlanFeedbackHandler(deepSeekManager)).Methods("POST")
+	router.HandleFunc("/deepseek/validate-schedule-feedback", validateScheduleFeedbackHandler(deepSeekManager)).Methods("POST")
+	router.HandleFunc("/deepseek/generate-steps", generateStepsHandler(deepSeekManager)).Methods("POST")
+	router.HandleFunc("/deepseek/generate-schedule", generateScheduleHandler(deepSeekManager)).Methods("POST")
 
 	fmt.Println("Server started at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
