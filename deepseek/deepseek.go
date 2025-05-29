@@ -12,7 +12,7 @@ import (
 
 const (
 	deepSeekBaseURL = "https://api.deepseek.com/v1/chat/completions"
-	deepSeekAPIKey  = "sk-5f43682799c54539bed59121f9b02615"
+	deepSeekAPIKey  = "your_api_key"
 )
 
 type DeepSeekRequest struct {
